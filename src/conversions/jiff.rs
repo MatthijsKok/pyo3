@@ -1,28 +1,21 @@
-#![cfg(feature = "jiff")]
+// #![cfg(feature = "jiff")]
 //! Conversions to and from [jiff](https://docs.rs/jiff/)'s `Date`
 //!
 //! Other types are TODO
 
 use crate::conversion::IntoPyObject;
-use crate::exceptions::{PyTypeError, PyUserWarning, PyValueError};
-#[cfg(Py_LIMITED_API)]
-use crate::sync::GILOnceCell;
 use crate::types::any::PyAnyMethods;
-#[cfg(not(Py_LIMITED_API))]
-use crate::types::datetime::timezone_from_offset;
-use crate::types::PyNone;
-#[cfg(not(Py_LIMITED_API))]
 use crate::types::{
-    timezone_utc, PyDate, PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyTime, PyTimeAccess,
-    PyTzInfo, PyTzInfoAccess,
+    PyDate, PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyNone, PyTimeAccess, PyTzInfo,
+    PyTzInfoAccess,
 };
-use crate::{
-    ffi, Bound, FromPyObject, IntoPy, PyAny, PyErr, PyObject, PyResult, Python, ToPyObject,
-};
-#[cfg(Py_LIMITED_API)]
-use crate::{intern, DowncastError};
+use crate::{Bound, FromPyObject, IntoPy, PyAny, PyErr, PyObject, PyResult, Python, ToPyObject};
+use eyre::ContextCompat;
 
-use jiff::civil::Date;
+use crate::exceptions::{PyTypeError, PyValueError};
+use jiff::civil::{Date, DateTime};
+use jiff::tz::Offset;
+use jiff::{Timestamp, Zoned};
 
 impl ToPyObject for Date {
     #[inline]
@@ -47,10 +40,14 @@ impl<'py> IntoPyObject<'py> for Date {
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        let DateArgs { year, month, day } = (&self).into();
         #[cfg(not(Py_LIMITED_API))]
         {
-            PyDate::new(py, year, month, day)
+            PyDate::new(
+                py,
+                self.year().try_into()?,
+                self.month().try_into()?,
+                self.day().try_into()?,
+            )
         }
         #[cfg(Py_LIMITED_API)]
         {
@@ -70,6 +67,7 @@ impl<'py> IntoPyObject<'py> for &Date {
 
     #[inline]
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let date = *self;
         (*self).into_pyobject(py)
     }
 }
@@ -79,7 +77,12 @@ impl FromPyObject<'_> for Date {
         #[cfg(not(Py_LIMITED_API))]
         {
             let date = ob.downcast::<PyDate>()?;
-            py_date_to_naive_date(date)
+            Date::new(
+                date.get_year().try_into()?,
+                date.get_month().try_into()?,
+                date.get_day().try_into()?,
+            )
+            .map_err(|_| PyErr::new::<PyAny, _>("invalid or out-of-range date"))
         }
         #[cfg(Py_LIMITED_API)]
         {
@@ -89,50 +92,111 @@ impl FromPyObject<'_> for Date {
     }
 }
 
-// utils below ... ?
-
-struct DateArgs {
-    year: i32,
-    month: i8,
-    day: i8,
-}
-
-impl From<&Date> for DateArgs {
-    fn from(value: &Date) -> Self {
-        Self {
-            year: value.year() as i32,
-            month: value.month() as i8,
-            day: value.day() as i8,
+impl FromPyObject<'_> for DateTime {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<DateTime> {
+        #[cfg(not(Py_LIMITED_API))]
+        {
+            let datetime = ob.downcast::<PyDateTime>()?;
+            DateTime::new(
+                datetime.get_year().try_into()?,
+                datetime.get_month().try_into()?,
+                datetime.get_day().try_into()?,
+                datetime.get_hour().try_into()?,
+                datetime.get_minute().try_into()?,
+                datetime.get_second().try_into()?,
+                datetime.get_microsecond().try_into()?, // TODO convert microsecond to nanosecond
+            )
+            .map_err(|_| PyErr::new::<PyAny, _>("invalid or out-of-range date"))
+        }
+        #[cfg(Py_LIMITED_API)]
+        {
+            check_type(ob, &DatetimeTypes::get(ob.py()).date, "PyDate")?;
+            py_date_to_naive_date(ob)
         }
     }
 }
 
-#[cfg(not(Py_LIMITED_API))]
-fn py_date_to_civil_date(py_date: &impl PyDateAccess) -> PyResult<Date> {
-    use std::i16;
+impl FromPyObject<'_> for Offset {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Offset> {
+        #[cfg(not(Py_LIMITED_API))]
+        let ob = ob.downcast::<PyTzInfo>()?;
+        #[cfg(Py_LIMITED_API)]
+        check_type(ob, &DatetimeTypes::get(ob.py()).tzinfo, "PyTzInfo")?;
 
-    Date::new(
-        py_date.get_year().try_into().unwrap_or(i16::MAX),
-        py_date.get_month().try_into()?,
-        py_date.get_day().try_into()?,
-    )
-    .map_err(|e| PyValueError::new_err(e.to_string()))
-}
-
-#[cfg(Py_LIMITED_API)]
-fn py_date_to_civil_date(py_date: &Bound<'_, PyAny>) -> PyResult<Date> {
-    Date::new(
-        py_date.getattr(intern!(py_date.py(), "year"))?.extract()?,
-        py_date.getattr(intern!(py_date.py(), "month"))?.extract()?,
-        py_date.getattr(intern!(py_date.py(), "day"))?.extract()?,
-    )
-    .ok_or_else(|| PyValueError::new_err("invalid or out-of-range date"))
-}
-
-#[cfg(Py_LIMITED_API)]
-fn check_type(value: &Bound<'_, PyAny>, t: &PyObject, type_name: &'static str) -> PyResult<()> {
-    if !value.is_instance(t.bind(value.py()))? {
-        return Err(DowncastError::new(value, type_name).into());
+        let py_timedelta = ob.call_method1("utcoffset", (PyNone::get(ob.py()),))?;
+        if py_timedelta.is_none() {
+            return Err(PyTypeError::new_err(format!(
+                "{:?} is not a fixed offset timezone",
+                ob
+            )));
+        }
+        Offset::from_seconds(py_timedelta.downcast::<PyDelta>()?.get_seconds())
+            .map_err(|_| PyValueError::new_err("fixed offset out of bounds"))
     }
-    Ok(())
+}
+
+impl FromPyObject<'_> for Zoned {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Zoned> {
+        #[cfg(not(Py_LIMITED_API))]
+        {
+            let datetime = ob.downcast::<PyDateTime>()?;
+            let timezone = datetime
+                .get_tzinfo()
+                .ok_or_else(|| PyErr::new::<PyAny, _>("missing timezone"))?
+                .extract::<Offset>()?
+                .to_time_zone();
+            datetime
+                .extract::<DateTime>()?
+                .to_zoned(timezone)
+                .map_err(|_| PyErr::new::<PyAny, _>("invalid or out-of-range date"))
+        }
+        #[cfg(Py_LIMITED_API)]
+        {
+            check_type(ob, &DatetimeTypes::get(ob.py()).date, "PyDate")?;
+            py_date_to_naive_date(ob)
+        }
+    }
+}
+
+impl FromPyObject<'_> for Timestamp {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Timestamp> {
+        #[cfg(not(Py_LIMITED_API))]
+        {
+            ob.extract().map(Zoned::timestamp)
+        }
+        #[cfg(Py_LIMITED_API)]
+        {
+            check_type(ob, &DatetimeTypes::get(ob.py()).date, "PyDate")?;
+            py_date_to_naive_date(ob)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn test_pyo3_date_topyobject() {
+        let eq_ymd = |name: &'static str, year, month, day| {
+            Python::with_gil(|py| {
+                let date = Date::new(year, month, day).unwrap().to_object(py);
+                let py_date = PyDate::new(py, year as i32, month as u8, day as u8).unwrap();
+                assert_eq!(
+                    date.bind(py).compare(&py_date).unwrap(),
+                    Ordering::Equal,
+                    "{}: {} != {}",
+                    name,
+                    date,
+                    py_date
+                );
+            })
+        };
+
+        eq_ymd("past date", 2012, 2, 29);
+        eq_ymd("min date", 1, 1, 1);
+        eq_ymd("future date", 3000, 6, 5);
+        eq_ymd("max date", 9999, 12, 31);
+    }
 }
